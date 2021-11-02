@@ -1,8 +1,9 @@
 package azalea
 
 import (
+	"fmt"
+	"log"
 	"math/rand"
-	"net"
 	"os"
 	"sync"
 	"time"
@@ -16,6 +17,8 @@ type LogEntry struct {
 
 // CMState tracks which state we are currently in (the CM is itself a state machine):
 type CMState int
+
+const DebugCM = 1
 
 const (
 	Follower CMState = iota
@@ -44,17 +47,49 @@ func (s CMState) String() string {
 type ConsensusModule struct {
 	mu sync.Mutex // protects CM
 
-	ip    net.IP   // ip address of this CM
-	peers []net.IP // list of the ip addresses of our peers in the cluster
+	id    int   // id address of this CM
+	peers []int // list of the id addresses of our peers in the cluster
+
+	server *Server
 
 	// Persistent Raft state on all servers
 	currentTerm int
-	votedFor    net.IP
+	votedFor    int
 	log         []LogEntry
 
 	// Volatile Raft state on all servers
 	state              CMState
 	electionResetEvent time.Time
+}
+
+// dlog logs a debugging message is DebugCM > 0.
+func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
+	if DebugCM > 0 {
+		format = fmt.Sprintf("[%d] ", cm.id) + format
+		log.Printf(format, args...)
+	}
+}
+
+// NewConsensusModule creates a new CM with the given ID, list of peer IDs and server. The ready channel signals the CM
+// that all peers are connected, and it's safe to start its state machine.
+func NewConsensusModule(id int, peers []int, server *Server, ready <-chan interface{}) *ConsensusModule {
+	cm := new(ConsensusModule)
+	cm.id = id
+	cm.peers = peers
+	cm.server = server
+	cm.state = Follower
+	cm.votedFor = -1
+
+	go func() {
+		// The CM is quiescent until ready is signaled; then, it starts a countdown for leader election.
+		<-ready
+		cm.mu.Lock()
+		cm.electionResetEvent = time.Now()
+		cm.mu.Unlock()
+		cm.runElectionTimer()
+	}()
+
+	return cm
 }
 
 // runElectionTimer runs in the background constantly to determine if we should try to run a new election. The current
@@ -65,7 +100,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
 	cm.mu.Unlock()
-	Log(ConsensusModuleId, Debug, "election timer started (%v), term=%d", timeout, termStarted)
+	cm.dlog("election timer started (%v), term=%d", timeout, termStarted)
 
 	// Loop until either:
 	// 1. the election timer is no longer needed, or
@@ -78,13 +113,13 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		cm.mu.Lock()
 		if cm.state != Candidate && cm.state != Follower {
-			Log(ConsensusModuleId, Debug, "in election timer state=%s, bailing out", cm.state)
+			cm.dlog("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
 			return
 		}
 
 		if termStarted != cm.currentTerm {
-			Log(ConsensusModuleId, Debug, "in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+			cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
 			return
 		}
@@ -100,6 +135,22 @@ func (cm *ConsensusModule) runElectionTimer() {
 	}
 }
 
+// Report reports the state of the CM
+func (cm *ConsensusModule) Report() (id, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+// Stop stops this CM, cleaning up its state. The method returns quickly, but it
+// may take up to ~election timeout for all goroutines to exit.
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = Dead
+	cm.dlog("becomes Dead")
+}
+
 //RequestVote RPC. This code is requested by some other server who is running an election
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
@@ -107,36 +158,36 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == Dead {
 		return nil
 	}
-	Log(ConsensusModuleId, Debug, "RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
 
 	if args.Term > cm.currentTerm {
-		Log(ConsensusModuleId, Debug, "... term out of date in RequestVote")
+		cm.dlog("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
 
-	if cm.currentTerm == args.Term && (cm.votedFor == nil || cm.votedFor.String() == args.Candidate) {
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.Candidate) {
 		reply.VoteGranted = true
-		cm.votedFor = net.ParseIP(args.Candidate)
+		cm.votedFor = args.Candidate
 		cm.electionResetEvent = time.Now()
 	} else {
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
-	Log(ConsensusModuleId, Debug, "... RequestVote reply: %+v", reply)
+	cm.dlog("... RequestVote reply: %+v", reply)
 	return nil
 }
 
 // AppendEntries RPC. The leader is sending us a new log entry or a heartbeat
-func (cm *ConsensusModule) AppendEntries(args AppendEntries, reply *AppendEntriesReply) error {
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.state == Dead {
 		return nil
 	}
-	Log(ConsensusModuleId, Debug, "AppendEntries: %+v", args)
+	cm.dlog("AppendEntries: %+v", args)
 
 	if args.Term > cm.currentTerm {
-		Log(ConsensusModuleId, Debug, "... term out of date in AppendEntries")
+		cm.dlog("... term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -150,13 +201,13 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntries, reply *AppendEntrie
 	}
 
 	reply.Term = cm.currentTerm
-	Log(ConsensusModuleId, Debug, "... AppendEntries reply: %+v", reply)
+	cm.dlog("... AppendEntries reply: %+v", reply)
 	return nil
 }
 
 // electionTimeout generates a pseudo-random election timeout
 func (cm *ConsensusModule) electionTimeout() time.Duration {
-	// The election timeout is randomized to avoid multiple servers declaring themselves candidates at the same time.
+	// The election timeout is randomized to avoid multidle servers declaring themselves candidates at the same time.
 	// It is possible for that to occur but becomes less likely as subsequent elections are requested.
 	if len(os.Getenv(RaftForceMoreReelection)) > 0 && rand.Intn(3) == 0 {
 		return 150 * time.Millisecond
@@ -175,46 +226,48 @@ func (cm *ConsensusModule) startElection() {
 	cm.currentTerm += 1
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
-	cm.votedFor = cm.ip
-	Log(ConsensusModuleId, Debug, "becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+	cm.votedFor = cm.id
+	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
 	votesReceived := 1
 
 	// Send RequestVote RPCs to peers
-	for _, peerIp := range cm.peers {
-		go func(peerIp net.IP) {
+	for _, peerId := range cm.peers {
+		go func(peerId int) {
 			args := RequestVoteArgs{
 				Term:      savedCurrentTerm,
-				Candidate: cm.ip.String(),
+				Candidate: cm.id,
 			}
 			var reply RequestVoteReply
 
-			Log(ConsensusModuleId, Debug, "sending RequestVote to %d: %+v", peerIp, args)
-			if err := cm.server.Call(peerIp, CMRequestVote, args, &reply); err != nil {
+			cm.dlog("sending RequestVote to %d: %+v", peerId, args)
+			if err := cm.server.Call(peerId, CMRequestVote, args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				Log(ConsensusModuleId, Debug, "received RequestVoteReply %+v", reply)
+				cm.dlog("received RequestVoteReply %+v", reply)
 
 				if cm.state != Candidate {
-					Log(ConsensusModuleId, Debug, "while waiting for reply, state = %v", cm.state)
+					cm.dlog("while waiting for reply, state = %v", cm.state)
 					return
 				}
 
 				if reply.Term > savedCurrentTerm {
-					Log(ConsensusModuleId, Debug, "term out of date in RequestVoteReply")
+					cm.dlog("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == savedCurrentTerm {
-					votesReceived++
-					if votesReceived*2 > len(cm.peers)+1 {
-						// Won the election!
-						Log(ConsensusModuleId, Debug, "wins election with %d votes", votesReceived)
-						cm.becomeLeader()
-						return
+					if reply.VoteGranted {
+						votesReceived++
+						if votesReceived*2 > len(cm.peers)+1 {
+							// Won the election!
+							cm.dlog("wins election with %d votes", votesReceived)
+							cm.becomeLeader()
+							return
+						}
 					}
 				}
 			}
-		}(peerIp)
+		}(peerId)
 	}
 
 	// Run another election timer in case this election is not successful
@@ -224,11 +277,11 @@ func (cm *ConsensusModule) startElection() {
 // becomeFollower makes this cm a follower and resets its state.
 // Expects mu to be locked.
 func (cm *ConsensusModule) becomeFollower(term int) {
-	Log(ConsensusModuleId, Info, "becomes Follower")
-	Log(ConsensusModuleId, Debug, "term=%d, log=%v", term, cm.log)
+	cm.dlog("becomes Follower")
+	cm.dlog("term=%d, log=%v", term, cm.log)
 	cm.state = Follower
 	cm.currentTerm = term
-	cm.votedFor = nil
+	cm.votedFor = -1
 	cm.electionResetEvent = time.Now()
 
 	go cm.runElectionTimer()
@@ -237,8 +290,8 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // becomeLeader makes this cm a leader and begins sending heartbeats.
 // Expects mu to be locked.
 func (cm *ConsensusModule) becomeLeader() {
-	Log(ConsensusModuleId, Info, "becomes Leader")
-	Log(ConsensusModuleId, Debug, "term=%d, log=%v", cm.currentTerm, cm.log)
+	cm.dlog("becomes Leader")
+	cm.dlog("term=%d, log=%v", cm.currentTerm, cm.log)
 	cm.state = Leader
 
 	go func() {
@@ -265,23 +318,23 @@ func (cm *ConsensusModule) sendHeartbeats() {
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
-	for _, peerIp := range cm.peers {
-		args := AppendEntries{
+	for _, peerId := range cm.peers {
+		args := AppendEntriesArgs{
 			Term:   cm.currentTerm,
-			Leader: cm.ip.String(),
+			Leader: cm.id,
 		}
-		go func(peerIp net.IP) {
-			Log(ConsensusModuleId, Debug, "sending heartbeat to %v: ni=%d, args=%+v", peerIp.String(), 0, args)
+		go func(peerId int) {
+			cm.dlog("sending heartbeat to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
-			if err := cm.server.Call(peerIp, CMAppendEntries, args, &reply); err == nil {
+			if err := cm.server.Call(peerId, CMAppendEntries, args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
-					Log(ConsensusModuleId, Debug, "term out of date in heartbeat reply")
+					cm.dlog("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
 				}
 			}
-		}(peerIp)
+		}(peerId)
 	}
 }

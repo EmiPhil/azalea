@@ -2,19 +2,19 @@ package azalea
 
 // Raft RPC requests
 
-type RPCId int
+type rpcCommand string
 
 const (
-	CMRequestVote RPCId = iota
-	CMRequestVoteReply
-	CMAppendEntries
-	CMAppendEntriesReply
+	CMRequestVote        rpcCommand = "ConsensusModule.RequestVote"
+	CMRequestVoteReply              = "ConsensusModule.RequestVoteReply"
+	CMAppendEntries                 = "ConsensusModule.AppendEntries"
+	CMAppendEntriesReply            = "ConsensusModule.AppendEntriesReply"
 )
 
 // RequestVoteArgs represents the data needed when we become a candidate to be the next leader
 type RequestVoteArgs struct {
 	Term         int
-	Candidate    string // ip addr
+	Candidate    int
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -25,10 +25,10 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntries represents the data we send to add entries to the followers
-type AppendEntries struct {
+// AppendEntriesArgs represents the data we send to add entries to the followers
+type AppendEntriesArgs struct {
 	Term   int
-	Leader string // ip addr
+	Leader int
 }
 
 // AppendEntriesReply represents the data we receive from an AppendEntries request
