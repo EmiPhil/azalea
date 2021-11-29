@@ -25,10 +25,16 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntriesArgs represents the data we send to add entries to the followers
+// AppendEntriesArgs represents the data we send to add entries to the followers.
+// Figure 2 of Raft paper.
 type AppendEntriesArgs struct {
 	Term   int
 	Leader int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 // AppendEntriesReply represents the data we receive from an AppendEntries request
